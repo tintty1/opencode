@@ -18,6 +18,40 @@ function getUrls(domain: string) {
   }
 }
 
+const SYNTHETIC_PATTERNS = [
+  /^Tool \w+ returned an attachment:/,
+  /^What did we do so far\?/,
+  /^The following tool was executed by the user$/,
+  /^Tool result:/i,
+  /^Tool output:/i,
+]
+
+function isSynthetic(text: string): boolean {
+  if (!text || typeof text !== "string") return false
+  const trimmed = text.trim()
+  return SYNTHETIC_PATTERNS.some((p) => p.test(trimmed))
+}
+
+function hasSyntheticContent(content: unknown): boolean {
+  if (typeof content === "string") return isSynthetic(content)
+  if (!Array.isArray(content)) return false
+  return content.some((part: any) => isSynthetic(part.text || part.content || ""))
+}
+
+function detectAgent(messages: any[]): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) return false
+
+  // Rule 1: If any assistant/tool message exists, this is a continuation
+  const hasNonUser = messages.some((msg: any) => ["assistant", "tool"].includes(msg.role))
+  if (hasNonUser) return true
+
+  // Rule 2: Check if the LAST user message is synthetic (compaction, tool result, etc.)
+  const last = messages[messages.length - 1]
+  if (last?.role === "user" && hasSyntheticContent(last.content)) return true
+
+  return false
+}
+
 export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   return {
     auth: {
@@ -63,7 +97,8 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                       (msg: any) =>
                         Array.isArray(msg.content) && msg.content.some((part: any) => part.type === "image_url"),
                     ),
-                    isAgent: last?.role !== "user",
+                    // isAgent: last?.role !== "user",
+                    isAgent: body.messages.length > 2 || detectAgent(body.messages),
                   }
                 }
 
@@ -75,7 +110,8 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                       (item: any) =>
                         Array.isArray(item?.content) && item.content.some((part: any) => part.type === "input_image"),
                     ),
-                    isAgent: last?.role !== "user",
+                    // isAgent: last?.role !== "user",
+                    isAgent: body.messages.length > 2 || detectAgent(body.input),
                   }
                 }
               } catch {}
