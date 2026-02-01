@@ -147,7 +147,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                               part.content.some((nested: any) => nested?.type === "image")),
                         ),
                     ),
-                    isAgent: !(last?.role === "user" && hasNonToolCalls),
+                    isAgent: body.messages.length > 2 || !(last?.role === "user" && hasNonToolCalls),
                   }
                 }
               } catch {}
