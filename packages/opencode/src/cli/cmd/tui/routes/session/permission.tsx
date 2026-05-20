@@ -11,32 +11,14 @@ import { useProject } from "../../context/project"
 import path from "path"
 import { LANGUAGE_EXTENSIONS } from "@/lsp/language"
 import { Locale } from "@/util/locale"
-import { Global } from "@opencode-ai/core/global"
 import { ShellID } from "@/tool/shell/id"
-import { useDialog } from "../../ui/dialog"
+import { webSearchProviderLabel } from "@/tool/websearch"
 import { getScrollAcceleration } from "../../util/scroll"
 import { useTuiConfig } from "../../context/tui-config"
-import { useBindings, useCommandShortcut } from "../../keymap"
+import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut } from "../../keymap"
+import { usePathFormatter } from "../../context/path-format"
 
 type PermissionStage = "permission" | "always" | "reject"
-
-function normalizePath(input?: string) {
-  if (!input) return ""
-
-  const cwd = process.cwd()
-  const home = Global.Path.home
-  const absolute = path.isAbsolute(input) ? input : path.resolve(cwd, input)
-  const relative = path.relative(cwd, absolute)
-
-  if (!relative) return "."
-  if (!relative.startsWith("..")) return relative
-
-  // outside cwd - use ~ or absolute
-  if (home && (absolute === home || absolute.startsWith(home + path.sep))) {
-    return absolute.replace(home, "~")
-  }
-  return absolute
-}
 
 function filetype(input?: string) {
   if (!input) return "none"
@@ -136,6 +118,7 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
   const [store, setStore] = createStore({
     stage: "permission" as PermissionStage,
   })
+  const pathFormatter = usePathFormatter()
 
   const session = createMemo(() => sync.data.session.find((s) => s.id === props.request.sessionID))
 
@@ -219,7 +202,7 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
               const filepath = typeof raw === "string" ? raw : ""
               return {
                 icon: "→",
-                title: `Edit ${normalizePath(filepath)}`,
+                title: `Edit ${pathFormatter.format(filepath)}`,
                 body: <EditBody request={props.request} />,
               }
             }
@@ -229,11 +212,11 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
               const filePath = typeof raw === "string" ? raw : ""
               return {
                 icon: "→",
-                title: `Read ${normalizePath(filePath)}`,
+                title: `Read ${pathFormatter.format(filePath)}`,
                 body: (
                   <Show when={filePath}>
                     <box paddingLeft={1}>
-                      <text fg={theme.textMuted}>{"Path: " + normalizePath(filePath)}</text>
+                      <text fg={theme.textMuted}>{"Path: " + pathFormatter.format(filePath)}</text>
                     </box>
                   </Show>
                 ),
@@ -275,11 +258,11 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
               const dir = typeof raw === "string" ? raw : ""
               return {
                 icon: "→",
-                title: `List ${normalizePath(dir)}`,
+                title: `List ${pathFormatter.format(dir)}`,
                 body: (
                   <Show when={dir}>
                     <box paddingLeft={1}>
-                      <text fg={theme.textMuted}>{"Path: " + normalizePath(dir)}</text>
+                      <text fg={theme.textMuted}>{"Path: " + pathFormatter.format(dir)}</text>
                     </box>
                   </Show>
                 ),
@@ -338,7 +321,7 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
               const query = typeof data.query === "string" ? data.query : ""
               return {
                 icon: "◈",
-                title: `Exa Web Search "${query}"`,
+                title: `${webSearchProviderLabel(data.provider)} "${query}"`,
                 body: (
                   <Show when={query}>
                     <box paddingLeft={1}>
@@ -358,7 +341,7 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
                 typeof pattern === "string" ? (pattern.includes("*") ? path.dirname(pattern) : pattern) : undefined
 
               const raw = parent ?? filepath ?? derived
-              const dir = normalizePath(raw)
+              const dir = pathFormatter.format(raw)
               const patterns = (props.request.patterns ?? []).filter((p): p is string => typeof p === "string")
 
               return {
@@ -462,24 +445,29 @@ function RejectPrompt(props: { onConfirm: (message: string) => void; onCancel: (
   let input: TextareaRenderable
   const { theme } = useTheme()
   const tuiConfig = useTuiConfig()
-  const keymapConfig = tuiConfig.keymap
   const dimensions = useTerminalDimensions()
   const narrow = createMemo(() => dimensions().width < 80)
-  const dialog = useDialog()
   useBindings(() => ({
-    enabled: dialog.stack.length === 0,
+    mode: OPENCODE_BASE_MODE,
     commands: [
       {
-        name: "permission.reject.cancel",
+        name: "app.exit",
+        title: "Cancel permission rejection",
+        category: "Permission",
         run() {
           props.onCancel()
         },
       },
     ],
     bindings: [
-      { key: "escape", cmd: () => props.onCancel() },
-      ...keymapConfig.pick("permission", ["permission.reject.cancel"]),
-      { key: "return", cmd: () => props.onConfirm(input.plainText) },
+      { key: "escape", desc: "Cancel permission rejection", group: "Permission", cmd: () => props.onCancel() },
+      ...tuiConfig.keybinds.get("app.exit"),
+      {
+        key: "return",
+        desc: "Confirm permission rejection",
+        group: "Permission",
+        cmd: () => props.onConfirm(input.plainText),
+      },
     ],
   }))
 
@@ -545,7 +533,6 @@ function Prompt<const T extends Record<string, string>>(props: {
 }) {
   const { theme } = useTheme()
   const tuiConfig = useTuiConfig()
-  const keymapConfig = tuiConfig.keymap
   const dimensions = useTerminalDimensions()
   const keys = Object.keys(props.options) as (keyof T)[]
   const [store, setStore] = createStore({
@@ -553,14 +540,15 @@ function Prompt<const T extends Record<string, string>>(props: {
     expanded: false,
   })
   const narrow = createMemo(() => dimensions().width < 80)
-  const dialog = useDialog()
   const fullscreenHint = useCommandShortcut("permission.prompt.fullscreen")
 
   useBindings(() => ({
-    enabled: dialog.stack.length === 0,
+    mode: OPENCODE_BASE_MODE,
     commands: [
       {
-        name: "permission.prompt.escape",
+        name: "app.exit",
+        title: "Reject permission",
+        category: "Permission",
         run() {
           if (!props.escapeKey) return
           props.onSelect(props.escapeKey)
@@ -568,6 +556,8 @@ function Prompt<const T extends Record<string, string>>(props: {
       },
       {
         name: "permission.prompt.fullscreen",
+        title: "Toggle permission fullscreen",
+        category: "Permission",
         run() {
           if (!props.fullscreen) return
           setStore("expanded", (v) => !v)
@@ -577,6 +567,8 @@ function Prompt<const T extends Record<string, string>>(props: {
     bindings: [
       {
         key: "left",
+        desc: "Previous permission option",
+        group: "Permission",
         cmd: () => {
           const idx = keys.indexOf(store.selected)
           const next = keys[(idx - 1 + keys.length) % keys.length]
@@ -585,6 +577,8 @@ function Prompt<const T extends Record<string, string>>(props: {
       },
       {
         key: "h",
+        desc: "Previous permission option",
+        group: "Permission",
         cmd: () => {
           const idx = keys.indexOf(store.selected)
           const next = keys[(idx - 1 + keys.length) % keys.length]
@@ -593,6 +587,8 @@ function Prompt<const T extends Record<string, string>>(props: {
       },
       {
         key: "right",
+        desc: "Next permission option",
+        group: "Permission",
         cmd: () => {
           const idx = keys.indexOf(store.selected)
           const next = keys[(idx + 1) % keys.length]
@@ -601,16 +597,32 @@ function Prompt<const T extends Record<string, string>>(props: {
       },
       {
         key: "l",
+        desc: "Next permission option",
+        group: "Permission",
         cmd: () => {
           const idx = keys.indexOf(store.selected)
           const next = keys[(idx + 1) % keys.length]
           setStore("selected", next)
         },
       },
-      { key: "return", cmd: () => props.onSelect(store.selected) },
-      ...(props.escapeKey ? [{ key: "escape", cmd: () => props.onSelect(props.escapeKey!) }] : []),
-      ...(props.escapeKey ? keymapConfig.pick("permission", ["permission.prompt.escape"]) : []),
-      ...(props.fullscreen ? keymapConfig.pick("permission", ["permission.prompt.fullscreen"]) : []),
+      {
+        key: "return",
+        desc: "Select permission option",
+        group: "Permission",
+        cmd: () => props.onSelect(store.selected),
+      },
+      ...(props.escapeKey
+        ? [
+            {
+              key: "escape",
+              desc: "Reject permission",
+              group: "Permission",
+              cmd: () => props.onSelect(props.escapeKey!),
+            },
+          ]
+        : []),
+      ...(props.escapeKey ? tuiConfig.keybinds.get("app.exit") : []),
+      ...(props.fullscreen ? tuiConfig.keybinds.get("permission.prompt.fullscreen") : []),
     ],
   }))
 

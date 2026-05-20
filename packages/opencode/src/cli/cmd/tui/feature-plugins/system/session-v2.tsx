@@ -1,14 +1,17 @@
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
+import type { InternalTuiPlugin } from "../../plugin/internal"
 import { useSyncV2 } from "@tui/context/sync-v2"
 import { SplitBorder } from "@tui/component/border"
 import { Spinner } from "@tui/component/spinner"
 import { useTheme } from "@tui/context/theme"
 import { useLocal } from "@tui/context/local"
+import { reasoningTitle, useThinkingMode } from "@tui/context/thinking"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import { TextAttributes, type BoxRenderable, type SyntaxStyle } from "@opentui/core"
 import { useBindings } from "../../keymap"
 import { Locale } from "@/util/locale"
 import { LANGUAGE_EXTENSIONS } from "@/lsp/language"
+import { webSearchProviderLabel } from "@/tool/websearch"
 import path from "path"
 import stripAnsi from "strip-ansi"
 import type {
@@ -27,6 +30,7 @@ import type {
   ToolTextContent,
 } from "@opencode-ai/sdk/v2"
 import { createEffect, createMemo, createSignal, For, Match, Show, Switch } from "solid-js"
+import { collapseToolOutput } from "../../util/collapse-tool-output"
 
 const id = "internal:session-v2-debug"
 const route = "session.v2.messages"
@@ -58,6 +62,8 @@ function View(props: { api: TuiPluginApi; sessionID: string }) {
     bindings: [
       {
         key: "escape",
+        desc: "Back to session",
+        group: "Session",
         cmd() {
           props.api.route.navigate("session", { sessionID: props.sessionID })
         },
@@ -89,6 +95,7 @@ function View(props: { api: TuiPluginApi; sessionID: string }) {
                   <Match when={message.type === "assistant"}>
                     <AssistantMessage
                       message={message as SessionMessageAssistant}
+                      sessionID={props.sessionID}
                       last={lastAssistant()?.id === message.id}
                       syntax={syntax()}
                       subtleSyntax={subtleSyntax()}
@@ -192,26 +199,28 @@ function UserMessage(props: { message: SessionMessageUser; index: number }) {
 
 function ShellMessage(props: { message: SessionMessageShell }) {
   const { theme } = useTheme()
+  const dimensions = useTerminalDimensions()
   const output = createMemo(() => stripAnsi(props.message.output.trim()))
   const [expanded, setExpanded] = createSignal(false)
-  const lines = createMemo(() => output().split("\n"))
-  const overflow = createMemo(() => lines().length > 10)
+  const maxLines = 10
+  const maxChars = createMemo(() => maxLines * Math.max(20, dimensions().width - 6))
+  const collapsed = createMemo(() => collapseToolOutput(output(), maxLines, maxChars()))
   const limited = createMemo(() => {
-    if (expanded() || !overflow()) return output()
-    return [...lines().slice(0, 10), "…"].join("\n")
+    if (expanded() || !collapsed().overflow) return output()
+    return collapsed().output
   })
   return (
     <BlockTool
       title="# Shell"
       spinner={!props.message.time.completed}
-      onClick={overflow() ? () => setExpanded((prev) => !prev) : undefined}
+      onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
     >
       <box gap={1}>
         <text fg={theme.text}>$ {props.message.command}</text>
         <Show when={output()}>
           <text fg={theme.text}>{limited()}</text>
         </Show>
-        <Show when={overflow()}>
+        <Show when={collapsed().overflow}>
           <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
         </Show>
       </box>
@@ -286,6 +295,7 @@ function UnknownMessage(props: { message: SessionMessage }) {
 
 function AssistantMessage(props: {
   message: SessionMessageAssistant
+  sessionID: string
   last: boolean
   syntax: SyntaxStyle
   subtleSyntax: SyntaxStyle
@@ -311,10 +321,14 @@ function AssistantMessage(props: {
               <AssistantText part={part as SessionMessageAssistantText} syntax={props.syntax} />
             </Match>
             <Match when={part.type === "reasoning"}>
-              <AssistantReasoning part={part as SessionMessageAssistantReasoning} subtleSyntax={props.subtleSyntax} />
+              <AssistantReasoning
+                part={part as SessionMessageAssistantReasoning}
+                subtleSyntax={props.subtleSyntax}
+                completedAt={() => props.message.time.completed}
+              />
             </Match>
             <Match when={part.type === "tool"}>
-              <AssistantTool part={part as SessionMessageAssistantTool} />
+              <AssistantTool part={part as SessionMessageAssistantTool} sessionID={props.sessionID} />
             </Match>
           </Switch>
         )}
@@ -372,35 +386,69 @@ function AssistantText(props: { part: SessionMessageAssistantText; syntax: Synta
   )
 }
 
-function AssistantReasoning(props: { part: SessionMessageAssistantReasoning; subtleSyntax: SyntaxStyle }) {
+function AssistantReasoning(props: {
+  part: SessionMessageAssistantReasoning
+  subtleSyntax: SyntaxStyle
+  completedAt: () => number | undefined
+}) {
   const { theme } = useTheme()
+  const thinking = useThinkingMode()
+  const [expanded, setExpanded] = createSignal(false)
   const content = createMemo(() => props.part.text.replace("[REDACTED]", "").trim())
+  const inMinimal = createMemo(() => thinking.mode() === "hide")
+  // v2 reasoning parts have no per-part `time.end` (see SessionMessageAssistantReasoning
+  // in the v2 SDK); we settle on parent-message completion instead.
+  const isDone = createMemo(() => props.completedAt() !== undefined)
+  const title = createMemo(() => reasoningTitle(content()))
+
+  const toggle = () => {
+    if (!inMinimal()) return
+    setExpanded((prev) => !prev)
+  }
+
   return (
     <Show when={content()}>
-      <box
-        paddingLeft={2}
-        marginTop={1}
-        flexDirection="column"
-        border={["left"]}
-        customBorderChars={SplitBorder.customBorderChars}
-        borderColor={theme.backgroundElement}
-        flexShrink={0}
-      >
-        <code
-          filetype="markdown"
-          drawUnstyledText={false}
-          streaming={true}
-          syntaxStyle={props.subtleSyntax}
-          content={"_Thinking:_ " + content()}
-          conceal={true}
-          fg={theme.textMuted}
-        />
-      </box>
+      <Switch>
+        <Match when={!inMinimal() || expanded()}>
+          <box
+            paddingLeft={2}
+            marginTop={1}
+            flexDirection="column"
+            border={["left"]}
+            customBorderChars={SplitBorder.customBorderChars}
+            borderColor={theme.backgroundElement}
+            flexShrink={0}
+            onMouseUp={toggle}
+          >
+            <code
+              filetype="markdown"
+              drawUnstyledText={false}
+              streaming={true}
+              syntaxStyle={props.subtleSyntax}
+              content={(inMinimal() ? "▼ " : "") + "_Thinking:_ " + content()}
+              conceal={true}
+              fg={theme.textMuted}
+            />
+          </box>
+        </Match>
+        <Match when={isDone()}>
+          <box paddingLeft={3} marginTop={1} flexShrink={0} onMouseUp={toggle}>
+            <text fg={theme.textMuted} wrapMode="none">
+              {title() ? "▶ Thought: " + title() : "▶ Thought"}
+            </text>
+          </box>
+        </Match>
+        <Match when={true}>
+          <box paddingLeft={3} marginTop={1} flexShrink={0} onMouseUp={toggle}>
+            <Spinner color={theme.textMuted}>{title() ? "Thinking: " + title() : "Thinking"}</Spinner>
+          </box>
+        </Match>
+      </Switch>
     </Show>
   )
 }
 
-function AssistantTool(props: { part: SessionMessageAssistantTool }) {
+function AssistantTool(props: { part: SessionMessageAssistantTool; sessionID: string }) {
   const input = createMemo(() => toolInputRecord(props.part.state.input))
   const toolprops = {
     get input() {
@@ -412,6 +460,7 @@ function AssistantTool(props: { part: SessionMessageAssistantTool }) {
     get output() {
       return props.part.state.status === "pending" ? undefined : toolOutput(props.part.state.content)
     },
+    sessionID: props.sessionID,
     part: props.part,
   }
   return (
@@ -430,9 +479,6 @@ function AssistantTool(props: { part: SessionMessageAssistantTool }) {
       </Match>
       <Match when={props.part.name === "webfetch"}>
         <WebFetch {...toolprops} />
-      </Match>
-      <Match when={props.part.name === "codesearch"}>
-        <CodeSearch {...toolprops} />
       </Match>
       <Match when={props.part.name === "websearch"}>
         <WebSearch {...toolprops} />
@@ -469,19 +515,21 @@ type ToolProps = {
   input: Record<string, unknown>
   metadata: Record<string, unknown>
   output?: string
+  sessionID: string
   part: SessionMessageAssistantTool
 }
 
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
+  const dimensions = useTerminalDimensions()
   const output = createMemo(() => props.output?.trim() ?? "")
   const [expanded, setExpanded] = createSignal(false)
-  const lines = createMemo(() => output().split("\n"))
   const maxLines = 3
-  const overflow = createMemo(() => lines().length > maxLines)
+  const maxChars = createMemo(() => maxLines * Math.max(20, dimensions().width - 6))
+  const collapsed = createMemo(() => collapseToolOutput(output(), maxLines, maxChars()))
   const limited = createMemo(() => {
-    if (expanded() || !overflow()) return output()
-    return [...lines().slice(0, maxLines), "…"].join("\n")
+    if (expanded() || !collapsed().overflow) return output()
+    return collapsed().output
   })
   return (
     <Show
@@ -495,11 +543,11 @@ function GenericTool(props: ToolProps) {
       <BlockTool
         title={`# ${props.part.name} ${input(props.input)}`}
         part={props.part}
-        onClick={overflow() ? () => setExpanded((prev) => !prev) : undefined}
+        onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
       >
         <box gap={1}>
           <text fg={theme.text}>{limited()}</text>
-          <Show when={overflow()}>
+          <Show when={collapsed().overflow}>
             <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
           </Show>
         </box>
@@ -658,15 +706,17 @@ function BlockTool(props: {
 
 function Bash(props: ToolProps) {
   const { theme } = useTheme()
+  const dimensions = useTerminalDimensions()
   const output = createMemo(() => stripAnsi((stringValue(props.metadata.output) ?? props.output ?? "").trim()))
   const command = createMemo(() => stringValue(props.input.command) ?? pendingInput(props.part))
   const title = createMemo(() => `# ${stringValue(props.input.description) ?? "Shell"}`)
   const [expanded, setExpanded] = createSignal(false)
-  const lines = createMemo(() => output().split("\n"))
-  const overflow = createMemo(() => lines().length > 10)
+  const maxLines = 10
+  const maxChars = createMemo(() => maxLines * Math.max(20, dimensions().width - 6))
+  const collapsed = createMemo(() => collapseToolOutput(output(), maxLines, maxChars()))
   const limited = createMemo(() => {
-    if (expanded() || !overflow()) return output()
-    return [...lines().slice(0, 10), "…"].join("\n")
+    if (expanded() || !collapsed().overflow) return output()
+    return collapsed().output
   })
   return (
     <Switch>
@@ -675,12 +725,12 @@ function Bash(props: ToolProps) {
           title={title()}
           part={props.part}
           spinner={props.part.state.status === "running"}
-          onClick={overflow() ? () => setExpanded((prev) => !prev) : undefined}
+          onClick={collapsed().overflow ? () => setExpanded((prev) => !prev) : undefined}
         >
           <box gap={1}>
             <text fg={theme.text}>$ {command()}</text>
             <text fg={theme.text}>{limited()}</text>
-            <Show when={overflow()}>
+            <Show when={collapsed().overflow}>
               <text fg={theme.textMuted}>{expanded() ? "Click to collapse" : "Click to expand"}</text>
             </Show>
           </box>
@@ -765,19 +815,11 @@ function WebFetch(props: ToolProps) {
   )
 }
 
-function CodeSearch(props: ToolProps) {
-  return (
-    <InlineTool icon="◇" pending="Searching code..." complete={toolComplete(props.part)} part={props.part}>
-      Exa Code Search "{stringValue(props.input.query) ?? pendingInput(props.part)}"{" "}
-      <Show when={numberValue(props.metadata.results)}>{(results) => <>({results()} results)</>}</Show>
-    </InlineTool>
-  )
-}
-
 function WebSearch(props: ToolProps) {
+  const label = createMemo(() => webSearchProviderLabel(props.metadata.provider))
   return (
     <InlineTool icon="◈" pending="Searching web..." complete={toolComplete(props.part)} part={props.part}>
-      Exa Web Search "{stringValue(props.input.query) ?? pendingInput(props.part)}"{" "}
+      {label()} "{stringValue(props.input.query) ?? pendingInput(props.part)}"{" "}
       <Show when={numberValue(props.metadata.numResults)}>{(results) => <>({results()} results)</>}</Show>
     </InlineTool>
   )
@@ -1138,7 +1180,7 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-const plugin: TuiPluginModule & { id: string } = {
+const plugin: InternalTuiPlugin = {
   id,
   tui,
 }
